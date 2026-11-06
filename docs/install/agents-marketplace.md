@@ -21,7 +21,7 @@ On Copilot:
 
 ```
 copilot plugin marketplace add <your-repo>
-copilot plugin install toolsmith@toolsmith-dev
+copilot plugin install toolsmith@toolsmith
 ```
 
 On Grok:

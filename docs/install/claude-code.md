@@ -17,7 +17,7 @@ claude plugin marketplace add <your-repo>
 ```
 
 ```
-claude plugin install toolsmith@toolsmith-dev
+claude plugin install toolsmith@toolsmith
 ```
 
 Or, inside a Claude Code session:
@@ -27,7 +27,7 @@ Or, inside a Claude Code session:
 ```
 
 ```
-/plugin install toolsmith@toolsmith-dev
+/plugin install toolsmith@toolsmith
 ```
 
 If the marketplace is already registered, only the install command is needed. Consult Claude Code's plugin docs if these commands don't match your installed version.

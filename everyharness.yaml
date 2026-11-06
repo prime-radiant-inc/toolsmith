@@ -12,4 +12,6 @@ harnesses:
   claude-code:
     hooks: own
 marketplace:
+  name: toolsmith
+  description: The toolsmith plugin
   source: local

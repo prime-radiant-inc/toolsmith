@@ -1,6 +1,6 @@
 {
-  "name": "toolsmith-dev",
-  "description": "Development marketplace for toolsmith",
+  "name": "toolsmith",
+  "description": "The toolsmith plugin",
   "plugins": [
     {
       "name": "toolsmith",
