@@ -1,0 +1,20 @@
+{
+  "name": "toolsmith-dev",
+  "description": "Development marketplace for toolsmith",
+  "plugins": [
+    {
+      "name": "toolsmith",
+      "description": "Stops agents from writing throwaway helper scripts: a toolsmith subagent builds, tests, and catalogs reusable command-line tools in a git-backed tools repo",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "Jesse Vincent",
+        "email": "jesse@fsck.com"
+      }
+    }
+  ],
+  "owner": {
+    "name": "Jesse Vincent",
+    "email": "jesse@fsck.com"
+  }
+}

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# inject <EventName>: SessionStart and SubagentStart hook for the toolsmith
+# plugin. Reads the hook's JSON on stdin and prints Claude Code's
+# hookSpecificOutput JSON with a few lines of tool-routing context: what
+# counts as a tool, how to search the catalogs (literal absolute paths from
+# `toolsmith-repo locate`), and to call the toolsmith instead of writing one.
+# Prints nothing for the toolsmith agent itself.
+#
+# A hook must never break session start, so every failure path still exits 0
+# with valid JSON. Like superpowers' session-start, this uses no external
+# command of its own (Claude Code can spawn startup hooks with a broken or
+# empty PATH, anthropics/claude-code#43127). Only toolsmith-repo needs PATH,
+# for git and POSIX utilities, so it gets /usr/bin:/bin appended; if it still
+# fails the context says so.
+
+set -euo pipefail
+
+# The parsing below needs bash. run-hook.cmd falls back to zsh when bash is
+# missing, and toolsmith-repo can't run then anyway, so stay quiet.
+[ -n "${BASH_VERSION:-}" ] || exit 0
+
+if [ "$#" -ne 1 ]; then
+    printf 'usage: inject <EventName>\n' >&2
+    exit 1
+fi
+event=$1
+
+# $0's directory without dirname, as in superpowers' session-start.
+case "$0" in
+    */*|*\\*) SCRIPT_DIR="${0%[/\\]*}" ;;
+    *) SCRIPT_DIR="." ;;
+esac
+PLUGIN_ROOT="${SCRIPT_DIR}/.."
+
+input=''
+IFS= read -r -d '' input || true
+
+# json_field <key>: set FIELD to the string value of "key" in the hook input,
+# or empty if absent. Only \\ and \" are unescaped; that covers paths.
+json_field() {
+    local re='"'"$1"'"[[:space:]]*:[[:space:]]*"((\\.|[^"\\])*)"'
+    FIELD=''
+    if [[ $input =~ $re ]]; then
+        FIELD=${BASH_REMATCH[1]}
+        FIELD=${FIELD//\\\\/\\}
+        FIELD=${FIELD//\\\"/\"}
+    fi
+}
+
+json_field agent_type
+[ "$FIELD" != "toolsmith:toolsmith" ] || exit 0
+
+json_field cwd
+cwd=$FIELD
+
+# Ask for the project scope only with a real cwd: --project "" is a usage
+# error. Exit 8 means cwd is not in a git repo; the global paths still come
+# first on stdout.
+locate_args=(locate)
+[ -z "$cwd" ] || locate_args+=(--project "$cwd")
+locate_rc=0
+locate_out=$(PATH="${PATH:+$PATH:}/usr/bin:/bin" "$BASH" "$PLUGIN_ROOT/bin/toolsmith-repo" "${locate_args[@]}" 2>/dev/null) ||
+    locate_rc=$?
+
+global_catalog=''
+project_catalog=''
+if [ "$locate_rc" -eq 0 ] || [ "$locate_rc" -eq 8 ]; then
+    rest="$locate_out"$'\n'
+    while [ -n "$rest" ]; do
+        line=${rest%%$'\n'*}
+        rest=${rest#*$'\n'}
+        case $line in
+            global_catalog=*) global_catalog=${line#global_catalog=} ;;
+            project_catalog=*) project_catalog=${line#project_catalog=} ;;
+        esac
+    done
+fi
+
+# shell_quote <string>: set QUOTED to the string in single quotes, safe to
+# paste into a shell command. The quote and its replacement live in
+# variables because bash 3.2 mangles backslashes in a double-quoted ${//}.
+shell_quote() {
+    local quote="'" escaped_quote="'\\''"
+    QUOTED="'${1//$quote/$escaped_quote}'"
+}
+
+definition="- A tool is code that you would run again or that is real logic, and is not part of the project's deliverable: a saved script, or a multi-line heredoc, python3 -c or node -e. Inline is fine for a single command line, or a throwaway inspection snippet of at most five lines you won't run again."
+call_toolsmith="call the Agent tool with subagent_type \"toolsmith:toolsmith\", run_in_background false (you need its reply), and a brief of what the tool must do, its inputs and outputs, an example invocation, and the closest existing catalog tool, if any."
+never="- Never write such a tool yourself, even a project-specific one. An explicit instruction from the human wins."
+no_agent="- No Agent tool? Don't write the tool. End your result with a TOOLSMITH REQUEST block (do:, io:, example:, closest: lines) and finish with existing commands. A parent that gets one must pass it to the toolsmith."
+skill="- For details, invoke the toolsmith:writing-tools skill."
+
+if [ -n "$global_catalog" ]; then
+    shell_quote "$global_catalog"
+    search="grep -s -i -E '<words>' $QUOTED"
+    # The project catalog joins the search only once it exists. `[` is a
+    # builtin, so the test is safe on an empty PATH.
+    if [ -n "$project_catalog" ] && [ -f "$project_catalog" ]; then
+        shell_quote "$project_catalog"
+        search="$search $QUOTED"
+    fi
+    context="Toolsmith: don't write your own helper tools.
+$definition
+- Before writing one, search the tool catalogs:
+  $search
+- -s skips a catalog that doesn't exist yet: a missing catalog means no tools yet. If a tool fits, run it with --help and use it.
+- Otherwise $call_toolsmith
+$never
+$no_agent
+$skill"
+else
+    context="Toolsmith: don't write your own helper tools.
+$definition
+- The tool catalog location couldn't be determined (toolsmith-repo locate failed), so let the toolsmith search it.
+- Before writing a tool, $call_toolsmith
+$never
+$no_agent
+$skill"
+fi
+
+# escape_for_json <string>: set ESCAPED to the string's JSON form, as
+# superpowers' session-start does it, plus \u00XX for the other control
+# characters (JSON forbids them raw, and a path can contain one).
+escape_for_json() {
+    local s="$1" hex char
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    for hex in 01 02 03 04 05 06 07 08 0b 0c 0e 0f \
+               10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f; do
+        printf -v char "\\x$hex"
+        s="${s//$char/\\u00$hex}"
+    done
+    ESCAPED="$s"
+}
+
+# emit_json absorbs EPIPE if the harness closes stdout early, without a pipe
+# through cat; see superpowers' session-start (#1612).
+emit_json() {
+    trap '' PIPE
+    # shellcheck disable=SC2059 # every caller passes a literal format string
+    printf "$@" 2>/dev/null || true
+}
+
+escape_for_json "$event"
+event_json=$ESCAPED
+escape_for_json "$context"
+emit_json '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' \
+    "$event_json" "$ESCAPED"
+exit 0

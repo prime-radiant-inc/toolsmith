@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Run the toolsmith test suite. See --help.
+
+tests_dir=$(cd -P -- "$(dirname -- "$0")" && pwd -P)
+tmp_dir=${TMPDIR:-/tmp}
+log_dir="${tmp_dir%/}/toolsmith-tests-$(id -u)"
+
+usage() {
+    cat <<EOF
+usage: tests/run [tests/test-NAME.sh ...]
+
+Runs the toolsmith test files (every tests/test-*.sh by default, or just the
+ones named) and prints one line per file:
+
+  PASS test-NAME.sh
+  PASS test-NAME.sh (skipped: WHAT; WHAT)
+  FAIL test-NAME.sh (log: PATH)
+
+A skipped check is one that could not run on this machine (for example, no
+claude on PATH). It counts as a pass, but the summary names it so it isn't
+mistaken for a check that ran.
+
+Use it before every commit, and name a single file while iterating on it.
+Each file's full output (one "ok"/"not ok" line per assertion, with want/got
+on failures) goes to $log_dir/test-NAME.log,
+so a failing run tells you which log to read instead of flooding the terminal.
+
+Exits 0 if every file passed, 1 otherwise.
+EOF
+}
+
+case ${1-} in
+    -h|--help) usage; exit 0 ;;
+esac
+
+mkdir -p "$log_dir" || exit 1
+
+if [ "$#" -eq 0 ]; then
+    set -- "$tests_dir"/test-*.sh
+    if [ ! -e "$1" ]; then
+        echo "tests/run: no tests/test-*.sh files found in $tests_dir." >&2
+        exit 1
+    fi
+fi
+
+status=0
+for test_file in "$@"; do
+    name=${test_file##*/}
+    log="$log_dir/${name%.sh}.log"
+    if "$BASH" "$test_file" >"$log" 2>&1; then
+        skips=$(awk 'sub(/^SKIP - /, "") { s = s (s == "" ? "" : "; ") $0 } END { print s }' "$log")
+        if [ -n "$skips" ]; then
+            echo "PASS $name (skipped: $skips)"
+        else
+            echo "PASS $name"
+        fi
+    else
+        echo "FAIL $name (log: $log)"
+        status=1
+    fi
+done
+exit "$status"

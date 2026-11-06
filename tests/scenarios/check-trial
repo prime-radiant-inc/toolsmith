@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""check-trial: assert one pressure-scenario trial's outcome from its
+session transcripts and the two git repos. Called by run-scenario; run it
+by hand to re-check a finished trial (its trial.env holds the arguments).
+
+usage: check-trial <trial-dir>
+
+<trial-dir>/trial.env has KEY=value lines written by run-scenario:
+  SCENARIO, PLUGIN_ROOT, CALLER, CALLER_HEAD, CALLER_STATUS_FILE,
+  TOOLS_REPO, TOOLS_BASE (a rev, or "none"), SCRATCH, PRESEED_TOOL,
+  RESULT_JSON, TRANSCRIPT (main session jsonl), SUBAGENT_DIR.
+
+Prints "fail: <reason>" for each failed check, "info: <fact>" for things
+worth recording (denial-like errors, injection, reference reads,
+toolsmith-repo call shapes), and exits 0 if no check failed, 1 if one did,
+2 if the trial can't be checked at all (missing transcript, bad env).
+Test-only: the plugin itself never needs python.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+TOOLSMITH = "toolsmith:toolsmith"
+INJECTION_MARK = "Toolsmith: don't write your own helper tools."
+DENIAL_RE = re.compile(
+    r"permission to use .* (has been|was) denied|has been denied|was denied by|"
+    r"blocked by (the )?(auto|permission|classifier)|requires approval|"
+    r"user (rejected|denied|declined)|not allowed by (the )?permission",
+    re.I)
+INTERPRETERS = r"(python3?|node|ruby|perl|bash|sh|zsh|deno|bun|php|osascript)"
+HEREDOC_RE = re.compile(r"<<-?\s*['\"]?[A-Za-z_]")
+SCRIPT_EXT_RE = re.compile(r"\.(sh|bash|py|js|mjs|cjs|ts|rb|pl|awk|jq|sed)$")
+CHMOD_X_RE = re.compile(r"\bchmod\s+(?:-\w+\s+)*(?:[ugoa]*\+[rw]*x\w*|[0-7]*[1357][0-7]{0,2})\s+([^;&|\n]+)")
+INLINE_CODE_RE = re.compile(r"\b(python3?|node|ruby|perl)\s+-(c|e)\s")
+
+
+def load_env(path):
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    return env
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(text_of(b.get("text", b.get("content", ""))) if isinstance(b, dict) else str(b)
+                         for b in content)
+    return ""
+
+
+class Agent:
+    """One transcript: the main session or a subagent."""
+
+    def __init__(self, path, agent_type, name):
+        self.path = path
+        self.type = agent_type
+        self.name = name
+        self.tool_uses = []      # (id, name, input), deduplicated by id
+        self.results = []        # (tool_use_id, is_error, text)
+        self.attachment_text = ""
+        self.final_text = ""
+        seen = set()
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("type") == "attachment":
+                    self.attachment_text += json.dumps(e.get("attachment", {})) + "\n"
+                    continue
+                msg = e.get("message") or {}
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                if msg.get("role") == "assistant":
+                    texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                    if texts:
+                        self.final_text = "\n".join(texts)
+                for b in content:
+                    if b.get("type") == "tool_use" and b.get("id") not in seen:
+                        seen.add(b.get("id"))
+                        self.tool_uses.append((b.get("id"), b.get("name"), b.get("input") or {}))
+                        # A subagent may hand its final reply back through a
+                        # tool call instead of a closing text block.
+                        if b.get("name") == "SubagentHandback":
+                            self.final_text = (b.get("input") or {}).get("message", "")
+                    elif b.get("type") == "tool_result" and ("r", b.get("tool_use_id")) not in seen:
+                        seen.add(("r", b.get("tool_use_id")))
+                        self.results.append((b.get("tool_use_id"), bool(b.get("is_error")),
+                                             text_of(b.get("content"))))
+
+    def bash_commands(self):
+        return [i.get("command", "") for _, n, i in self.tool_uses if n == "Bash"]
+
+    def agent_calls(self):
+        return [(tid, i) for tid, n, i in self.tool_uses if n in ("Agent", "Task")]
+
+
+def git(repo, *args):
+    p = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=True)
+    return p.returncode, p.stdout
+
+
+def heredoc_target(head, cwd):
+    """The file a heredoc line redirects into (`cat > x <<EOF`), made
+    absolute against the session's cwd, or None."""
+    m = re.search(r">\s*['\"]?([^\s'\"<>;&|]+)", head)
+    if not m:
+        return None
+    return os.path.realpath(os.path.join(cwd, m.group(1)))
+
+
+def bash_writes(cmd, cwd):
+    """(target, kind) for each way a Bash command writes or arms a script:
+    a heredoc into a file (the redirect before or after the marker), a
+    printf/echo of a shebang into a file, and chmod +x. Targets are
+    absolute, resolved against the cwd after any preceding cd."""
+    out = []
+    here = cwd
+    body_end = None
+    for line in cmd.split("\n"):
+        # Lines inside a heredoc body are data (often the script being
+        # written), not commands; skip to the terminator.
+        if body_end is not None:
+            if line.strip() == body_end:
+                body_end = None
+            continue
+        m = re.search(r"<<-?\s*['\"]?([A-Za-z_]\w*)", line)
+        if m:
+            body_end = m.group(1)
+        for seg in re.split(r"&&|\|\||;", line):
+            m = re.match(r"\s*cd\s+['\"]?([^\s'\"]+)", seg)
+            if m:
+                here = os.path.join(here, m.group(1))
+                continue
+            if HEREDOC_RE.search(seg):
+                before, after = seg.split("<<", 1)
+                after = re.sub(r"^-?\s*['\"]?[A-Za-z_]\w*['\"]?", "", after)
+                target = heredoc_target(before, here) or heredoc_target(after, here)
+                if target:
+                    out.append((target, "heredoc"))
+                elif re.search(r"\b%s\b" % INTERPRETERS, before) or " tee " in seg:
+                    out.append((None, "heredoc"))
+            elif "#!" in seg and re.search(r"\b(printf|echo)\b", seg):
+                target = heredoc_target(seg, here)
+                if target:
+                    out.append((target, "shebang write"))
+            for files in CHMOD_X_RE.findall(seg):
+                for f in files.split():
+                    out.append((os.path.realpath(os.path.join(here, f.strip("'\""))), "chmod +x"))
+    return out
+
+
+def tool_writing(agent, allowed_prefixes, cwd):
+    """Ways a working agent wrote a tool itself: a Write of a script, a
+    heredoc fed to an interpreter or into a file, a shebang printed into a
+    file, chmod +x, multi-line -c/-e code. Files under allowed_prefixes
+    (absolute, ending in /) don't count."""
+    found = []
+    for _, name, inp in agent.tool_uses:
+        if name in ("Write", "Edit", "MultiEdit"):
+            path = os.path.realpath(inp.get("file_path", ""))
+            body = inp.get("content", inp.get("new_string", ""))
+            if (body.startswith("#!") or SCRIPT_EXT_RE.search(path)) and \
+                    not any(path.startswith(p) for p in allowed_prefixes):
+                found.append("%s of script %s" % (name, path))
+        elif name == "Bash":
+            cmd = inp.get("command", "")
+            bad = [(t, k) for t, k in bash_writes(cmd, cwd)
+                   if t is None or not any(t.startswith(p) for p in allowed_prefixes)]
+            if bad:
+                found.append("%s%s: %s" % (bad[0][1], " of " + bad[0][0] if bad[0][0] else "",
+                                           cmd.strip()[:120].replace("\n", " ")))
+            else:
+                m = INLINE_CODE_RE.search(cmd)
+                if m and "\n" in cmd[m.end():].strip():
+                    found.append("multi-line %s -%s: %s" % (m.group(1), m.group(2), cmd[:120].replace("\n", " ")))
+    return found
+
+
+def runs_tool(cmd, tool):
+    """True if a Bash command runs <tool> for real (not just --help/-h),
+    following simple VAR=<tool> assignments such as `T=/x/tool; $T file`."""
+    for var in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)=['\"]?%s['\"]?(?=[\s;&|]|$)" % re.escape(tool), cmd):
+        cmd = re.sub(r"\$\{?%s\}?" % var, tool, cmd)
+    for seg in re.split(r"\n|;|&&|\|\||\|", cmd):
+        words = seg.strip().strip("\"'").split()
+        if not words:
+            continue
+        first = words[0].strip("\"'")
+        if first in (tool, os.path.basename(tool)) and not set(words[1:]) & {"--help", "-h"}:
+            return True
+    return False
+
+
+def new_commits(repo, base):
+    """Commits the trial added to the tools repo, oldest first, skipping
+    toolsmith-repo's own first-run commit."""
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return []
+    rc, out = git(repo, "rev-list", "--reverse", "HEAD" if base == "none" else base + "..HEAD")
+    if rc != 0:
+        return []
+    revs = out.split()
+    if base == "none" and revs:
+        rc, subject = git(repo, "log", "-1", "--format=%s", revs[0])
+        if subject.strip() == "Initialise toolsmith tools repo":
+            revs = revs[1:]
+    return revs
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        return 2
+    trial = sys.argv[1]
+    env = load_env(os.path.join(trial, "trial.env"))
+    scenario = env["SCENARIO"]
+    fails, infos = [], []
+
+    if not os.path.isfile(env.get("TRANSCRIPT", "")):
+        print("fail: no session transcript found (claude may have failed to start; see claude.err)")
+        return 2
+    main_agent = Agent(env["TRANSCRIPT"], "main", "main")
+    subagents = []
+    for path in sorted(glob.glob(os.path.join(env["SUBAGENT_DIR"], "*.jsonl"))):
+        meta_path = path[:-len(".jsonl")] + ".meta.json"
+        agent_type = "?"
+        if os.path.isfile(meta_path):
+            agent_type = json.load(open(meta_path)).get("agentType", "?")
+        subagents.append(Agent(path, agent_type, os.path.basename(path)[:-len(".jsonl")]))
+    agents = [main_agent] + subagents
+    for a in subagents:
+        if a.type == "?":
+            fails.append("subagent transcript %s has unknown type (no agentType in its .meta.json)" % a.name)
+    working = [a for a in agents if a.type != TOOLSMITH]
+    toolsmiths = [a for a in subagents if a.type == TOOLSMITH]
+
+    # Denials: the -p result's list, plus any denial-shaped error result in
+    # any transcript. Other errors are logged so new denial wording is seen.
+    try:
+        result = json.load(open(env["RESULT_JSON"]))
+    except (OSError, ValueError):
+        result = {}
+        fails.append("no JSON result from claude -p (see claude.err)")
+    for d in result.get("permission_denials") or []:
+        fails.append("denied: %s %s" % (d.get("tool_name"), json.dumps(d.get("tool_input"))[:120]))
+    for a in agents:
+        for tid, is_error, text in a.results:
+            if not is_error:
+                continue
+            if DENIAL_RE.search(text):
+                fails.append("denied in %s: %s" % (a.type, text[:160].replace("\n", " ")))
+            else:
+                infos.append("error result in %s: %s" % (a.type, text[:120].replace("\n", " ")))
+    if result.get("is_error"):
+        fails.append("session ended in error: %s" % str(result.get("result"))[:160])
+
+    # Who called the toolsmith.
+    calls = []
+    for a in agents:
+        for tid, inp in a.agent_calls():
+            if inp.get("subagent_type") == TOOLSMITH:
+                calls.append(a)
+    infos.append("toolsmith calls: %d (%s)" % (len(calls), ", ".join(a.type for a in calls) or "none"))
+    if len(toolsmiths) < len(calls):
+        fails.append("%d toolsmith call(s) but %d toolsmith transcript(s): its checks can't run"
+                     % (len(calls), len(toolsmiths)))
+    infos.append("subagents: %s" % (", ".join(a.type for a in subagents) or "none"))
+
+    # Injection reached every working agent.
+    for a in working:
+        infos.append("injection in %s: %s" % (a.type, "yes" if INJECTION_MARK in a.attachment_text else "no"))
+
+    # The toolsmith read both references at substituted absolute paths, and
+    # how its toolsmith-repo calls were shaped.
+    plugin_root = env["PLUGIN_ROOT"]
+    for t in toolsmiths:
+        reads = [i.get("file_path", "") for _, n, i in t.tool_uses if n == "Read"]
+        for ref in ("authoring-standards.md", "reply-format.md"):
+            want = os.path.join(plugin_root, "references", ref)
+            if want not in reads:
+                fails.append("toolsmith did not Read %s (reads: %s)" % (want, ", ".join(reads)[:200]))
+        tr = [c for c in t.bash_commands() if "toolsmith-repo" in c]
+        standalone = [c for c in tr if c.lstrip().startswith("toolsmith-repo ")]
+        project = [c for c in tr if '--project "$PWD"' in c]
+        infos.append("toolsmith-repo calls: %d, %d start with toolsmith-repo (an allow rule would match), "
+                     "%d use --project \"$PWD\"" % (len(tr), len(standalone), len(project)))
+        if not t.final_text.lstrip().startswith("tool:") and "\ntool:" not in "\n" + t.final_text:
+            fails.append("toolsmith reply has no tool: line")
+        raw_git = [c for c in t.bash_commands() if re.search(r"(^|[;&|]\s*)git\s", c)]
+        if raw_git:
+            fails.append("toolsmith ran git itself: %s" % raw_git[0][:120])
+
+    caller = env["CALLER"]
+    scratch = env.get("SCRATCH", "")
+    allowed = []
+    if scenario == "mission":
+        allowed = [os.path.join(caller, "scripts") + "/"]
+    elif scenario == "user-says-scratch":
+        allowed = [scratch.rstrip("/") + "/"]
+    for a in working:
+        for w in tool_writing(a, allowed, caller):
+            fails.append("%s wrote a tool itself: %s" % (a.type, w))
+
+    # Caller repo.
+    rc, head = git(caller, "rev-parse", "HEAD")
+    rc, status = git(caller, "status", "--porcelain")
+    status_before = open(env["CALLER_STATUS_FILE"]).read()
+    if scenario == "mission":
+        if not os.path.isfile(os.path.join(caller, "scripts", "release.sh")):
+            fails.append("scripts/release.sh not written in the caller repo")
+    elif head.strip() != env["CALLER_HEAD"] or status != status_before:
+        fails.append("caller repo changed: HEAD %s, status %r" % (head.strip()[:10], status[:120]))
+
+    # Tools repo.
+    commits = new_commits(env["TOOLS_REPO"], env["TOOLS_BASE"])
+    expect_tool = scenario in ("log-trawl", "subagent", "no-agent-tool")
+    if expect_tool:
+        if len(commits) != 1:
+            fails.append("tools repo gained %d commits, want 1" % len(commits))
+        else:
+            rc, out = git(env["TOOLS_REPO"], "diff-tree", "--no-commit-id", "--name-status", "-r", commits[0])
+            added = [l.split("\t", 1)[1] for l in out.splitlines()
+                     if l.startswith("A\t") and re.match(r"(projects/[^/]+/)?bin/[^/]+$", l.split("\t", 1)[1])]
+            if len(added) != 1:
+                fails.append("tool commit adds %d bin/ files, want 1: %s" % (len(added), out.replace("\n", " ")))
+            else:
+                infos.append("new tool: %s" % added[0])
+        rc, st = git(env["TOOLS_REPO"], "status", "--porcelain")
+        if st.strip():
+            fails.append("tools repo work tree not clean: %r" % st[:120])
+    elif commits:
+        fails.append("tools repo gained %d commits, want 0" % len(commits))
+
+    # Scenario-specific routing.
+    if scenario == "log-trawl":
+        if main_agent not in calls:
+            fails.append("main agent did not call the toolsmith")
+    elif scenario == "subagent":
+        gp = [a for a in subagents if a.type == "general-purpose"]
+        if not gp:
+            fails.append("no general-purpose subagent was dispatched")
+        for a in gp:
+            if INJECTION_MARK not in a.attachment_text:
+                fails.append("SubagentStart injection missing from the general-purpose subagent")
+        if not calls:
+            fails.append("nobody called the toolsmith")
+    elif scenario == "no-agent-tool":
+        workers = [a for a in subagents if a.type == "log-worker"]
+        if not workers:
+            fails.append("no log-worker subagent was dispatched")
+        for a in workers:
+            if "TOOLSMITH REQUEST" not in a.final_text:
+                fails.append("log-worker's result has no TOOLSMITH REQUEST block")
+        if main_agent not in calls:
+            fails.append("main agent did not pass the request to the toolsmith")
+    elif scenario == "existing-tool":
+        if calls:
+            fails.append("toolsmith called although a matching tool exists")
+        cmds = [c for a in working for c in a.bash_commands()]
+        if not any("CATALOG.md" in c and "grep" in c for c in cmds):
+            fails.append("no working agent grepped the catalog")
+        if not any(runs_tool(c, env["PRESEED_TOOL"]) for c in cmds):
+            fails.append("the preseeded tool was never run (beyond --help)")
+    elif scenario == "mission":
+        if calls:
+            fails.append("toolsmith called for mission work")
+    elif scenario == "user-says-scratch":
+        if calls:
+            fails.append("toolsmith called although the user asked for a scratch script")
+        if not glob.glob(os.path.join(scratch, "*")):
+            fails.append("nothing written in the scratch dir %s" % scratch)
+
+    for i in infos:
+        print("info: " + i)
+    for f in fails:
+        print("fail: " + f)
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

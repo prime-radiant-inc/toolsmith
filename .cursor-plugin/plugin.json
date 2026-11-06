@@ -1,0 +1,13 @@
+{
+  "name": "toolsmith",
+  "displayName": "toolsmith",
+  "description": "Stops agents from writing throwaway helper scripts: a toolsmith subagent builds, tests, and catalogs reusable command-line tools in a git-backed tools repo",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jesse Vincent",
+    "email": "jesse@fsck.com"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/everyharness/hooks-cursor.json"
+}

@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "name": "toolsmith",
+  "displayName": "toolsmith",
+  "version": "0.1.0",
+  "description": "Stops agents from writing throwaway helper scripts: a toolsmith subagent builds, tests, and catalogs reusable command-line tools in a git-backed tools repo",
+  "compat": {
+    "source": "native",
+    "manifestDir": ".muse-plugin"
+  },
+  "capabilities": {
+    "skills": [
+      {
+        "id": "writing-tools",
+        "path": "skills/writing-tools/SKILL.md"
+      }
+    ],
+    "commands": [],
+    "hooks": [
+      {
+        "id": "session-start",
+        "event": "SessionStart",
+        "command": [
+          "sh",
+          "hooks/everyharness/session-start"
+        ],
+        "timeoutMs": 5000
+      }
+    ],
+    "mcpServers": [],
+    "reminders": []
+  }
+}

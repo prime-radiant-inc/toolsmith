@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "toolsmith",
+  "version": "0.1.0",
+  "description": "Stops agents from writing throwaway helper scripts: a toolsmith subagent builds, tests, and catalogs reusable command-line tools in a git-backed tools repo",
+  "author": {
+    "name": "Jesse Vincent",
+    "email": "jesse@fsck.com"
+  },
+  "license": "MIT"
+}

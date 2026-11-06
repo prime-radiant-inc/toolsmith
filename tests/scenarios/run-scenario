@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# run-scenario: run toolsmith pressure scenarios in real claude -p sessions.
+# See --help.
+
+scenarios_dir=$(cd -P -- "$(dirname -- "$0")" && pwd -P)
+plugin_root=$(cd -P -- "$scenarios_dir/../.." && pwd -P)
+config_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+tmp_root=$(cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
+trial_timeout=900
+budget_usd=5
+
+usage() {
+    cat <<EOF
+usage: tests/scenarios/run-scenario <scenario> [--trials N] [--permission-mode M]
+                                    [--baseline]
+
+Runs a pressure scenario N times (default 1) in real \`claude -p\` sessions
+with this checkout loaded via --plugin-dir, then checks each session's
+transcripts and the caller and tools repos (tests/scenarios/check-trial).
+--baseline runs without the plugin, to see what agents do unaided.
+--permission-mode is passed to claude (default bypassPermissions).
+
+Scenarios (the prompt is tests/scenarios/<scenario>.md):
+$(cd -- "$scenarios_dir" && ls *.md | sed -n 's/^\(.*\)\.md$/  \1/p' | grep -v README)
+
+Each trial gets a fresh temp caller git repo and a fresh temp tools repo,
+passed to the plugin as TOOLSMITH_TEST_REPO. A trial fails if your real
+tools repos (~/.local/share/toolsmith/tools, ~/git/tools) change while it
+runs: whether each exists, and its HEAD and git status, are compared before
+and after (real-repos-before/after in the trial dir). claude runs with your
+real HOME (so it is logged in), with --setting-sources project and
+--strict-mcp-config so your user settings, CLAUDE.md, plugins, hooks
+(safety hooks included) and MCP servers don't load (see README.md).
+
+Prints one line per trial, PASS or FAIL with the first failed check and
+the transcript path, then a summary. Everything else (each check, claude's
+stdout and stderr, the trial's repos) goes to the log dir it prints.
+
+A trial is killed after ${trial_timeout}s and capped at \$${budget_usd} of API spend.
+Exits 0 if every trial passed, 1 if any failed, 2 on usage errors.
+EOF
+}
+
+die() {
+    printf 'run-scenario: %s\n' "$*" >&2
+    exit 2
+}
+
+scenario=''
+trials=1
+mode=bypassPermissions
+baseline=no
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        --trials) trials=${2-}; shift 2 || die "--trials needs a number" ;;
+        --permission-mode) mode=${2-}; shift 2 || die "--permission-mode needs a mode" ;;
+        --baseline) baseline=yes; shift ;;
+        -*) die "unknown option $1. Run with --help for usage." ;;
+        *) [ -z "$scenario" ] || die "only one scenario at a time"; scenario=$1; shift ;;
+    esac
+done
+[ -n "$scenario" ] || die "name a scenario. Run with --help for the list."
+prompt_file="$scenarios_dir/$scenario.md"
+[ -f "$prompt_file" ] && [ "$scenario" != README ] ||
+    die "no scenario $scenario (no $prompt_file). Run with --help for the list."
+case $trials in ''|*[!0-9]*|0) die "--trials must be a positive number" ;; esac
+command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
+command -v python3 >/dev/null 2>&1 || die "python3 is needed to check transcripts"
+
+label=$mode
+[ "$baseline" = no ] || label="$mode-baseline"
+run_dir="$tmp_root/toolsmith-scenarios-$(id -u)/$scenario-$label-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$run_dir" || die "could not create $run_dir"
+run_dir=$(cd -P -- "$run_dir" && pwd -P)
+
+home_canon=$(cd -P -- "$HOME" && pwd -P)
+# guard_tools_repo: canonicalise TOOLS_REPO itself (its parent must exist;
+# the repo may not yet) and die unless it is inside this run's temp dir and
+# outside HOME, so it can't be the real tools repo or anything near it.
+# Runs before anything uses TOOLS_REPO: the preseed and the claude launch.
+guard_tools_repo() {
+    local parent
+    parent=$(cd -P -- "${TOOLS_REPO%/*}" 2>/dev/null && pwd -P) ||
+        die "refusing to run: TOOLSMITH_TEST_REPO=$TOOLS_REPO has no existing parent dir"
+    TOOLS_REPO="$parent/${TOOLS_REPO##*/}"
+    case $TOOLS_REPO in
+        "$run_dir"/*) ;;
+        *) die "refusing to run: TOOLSMITH_TEST_REPO=$TOOLS_REPO is not under $run_dir" ;;
+    esac
+    case $TOOLS_REPO in
+        "$home_canon"|"$home_canon"/*) die "refusing to run: TOOLSMITH_TEST_REPO=$TOOLS_REPO is inside HOME ($home_canon)" ;;
+    esac
+}
+
+# real_repos_state: describe the real tools repos (the plugin's default
+# location and ~/git/tools): whether each exists and, for a git repo, its
+# HEAD and status. Trials run on the real HOME, so a change between before
+# and after a trial means the trial breached one. GIT_OPTIONAL_LOCKS=0
+# keeps git status from refreshing their index.
+real_repos_state() {
+    local path
+    for path in "$HOME/.local/share/toolsmith/tools" "$HOME/git/tools"; do
+        printf '== %s\n' "$path"
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            echo exists
+        else
+            echo absent
+            continue
+        fi
+        [ -e "$path/.git" ] || continue
+        printf 'HEAD %s\n' "$(GIT_OPTIONAL_LOCKS=0 git -C "$path" rev-parse -q --verify HEAD 2>&1)"
+        GIT_OPTIONAL_LOCKS=0 git -C "$path" status --porcelain 2>&1
+    done
+}
+
+git_q() {
+    git -C "$1" -c user.name=scenario -c user.email=scenario@localhost "${@:2}"
+}
+
+# setup_trial <dir>: create the caller repo and (for some scenarios) seed
+# the tools repo. Sets CALLER, TOOLS_REPO, TOOLS_BASE, SCRATCH, PRESEED_TOOL
+# and EXTRA_ARGS.
+setup_trial() {
+    local dir=$1
+    CALLER="$dir/caller"
+    TOOLS_REPO="$dir/tools/repo"
+    TOOLS_BASE=none
+    SCRATCH=''
+    PRESEED_TOOL=''
+    EXTRA_ARGS=()
+    mkdir -p "$CALLER" "$dir/tools"
+    guard_tools_repo
+    case $scenario in
+        mission) cp "$scenarios_dir/fixtures/mission/"* "$CALLER/" ;;
+        *) cp "$scenarios_dir/fixtures/access.log" "$CALLER/" ;;
+    esac
+    git_q "$CALLER" init -q && git_q "$CALLER" add . && git_q "$CALLER" commit -q -m "initial commit" ||
+        die "could not create the caller repo in $CALLER"
+    case $scenario in
+        existing-tool)
+            local out staged base
+            out=$(TOOLSMITH_TEST_REPO="$TOOLS_REPO" "$plugin_root/bin/toolsmith-repo" stage http-5xx-by-endpoint) ||
+                die "could not stage the preseeded tool"
+            staged=$(printf '%s\n' "$out" | sed -n 's/^staged=//p')
+            base=$(printf '%s\n' "$out" | sed -n 's/^base=//p')
+            cp "$scenarios_dir/fixtures/http-5xx-by-endpoint" "$staged"
+            TOOLSMITH_TEST_REPO="$TOOLS_REPO" "$plugin_root/bin/toolsmith-repo" install "$staged" \
+                http-5xx-by-endpoint --base "$base" -m "Add http-5xx-by-endpoint" >/dev/null ||
+                die "could not install the preseeded tool"
+            TOOLS_REPO=$(cd -P -- "$TOOLS_REPO" && pwd -P)
+            TOOLS_BASE=$(git -C "$TOOLS_REPO" rev-parse HEAD)
+            PRESEED_TOOL="$TOOLS_REPO/bin/http-5xx-by-endpoint"
+            ;;
+        user-says-scratch)
+            SCRATCH=$(mktemp -d /tmp/toolsmith-scenario-scratch.XXXXXX) || die "could not make a scratch dir"
+            SCRATCH=$(cd -P -- "$SCRATCH" && pwd -P)
+            ;;
+        no-agent-tool)
+            EXTRA_ARGS=(--agents '{"log-worker":{"description":"Analyses log files in the current repo and reports findings.","prompt":"You analyse log files in the current repository and report what you find, concisely.","tools":["Bash","Read","Grep","Glob"]}}')
+            ;;
+    esac
+}
+
+# run_claude <dir> <session-id> <prompt>: run claude -p in the caller repo,
+# killing it after trial_timeout seconds. Sets CLAUDE_RC.
+run_claude() {
+    local dir=$1 session=$2 prompt=$3 cpid wpid
+    local args=(-p "$prompt" --setting-sources project --strict-mcp-config
+        --session-id "$session" --output-format json --permission-mode "$mode"
+        --max-budget-usd "$budget_usd")
+    [ "$baseline" = yes ] || args+=(--plugin-dir "$plugin_root")
+    args+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
+    guard_tools_repo
+    (
+        cd -- "$CALLER" || exit 125
+        exec env TOOLSMITH_TEST_REPO="$TOOLS_REPO" claude "${args[@]}"
+    ) </dev/null >"$dir/claude.json" 2>"$dir/claude.err" &
+    cpid=$!
+    (
+        sleep "$trial_timeout" &
+        spid=$!
+        trap 'kill $spid 2>/dev/null; exit 0' TERM
+        wait "$spid"
+        echo "killed after ${trial_timeout}s" >>"$dir/claude.err"
+        kill "$cpid" 2>/dev/null
+    ) &
+    wpid=$!
+    wait "$cpid"
+    CLAUDE_RC=$?
+    kill "$wpid" 2>/dev/null
+    wait "$wpid" 2>/dev/null
+}
+
+prompt_template=$(cat "$prompt_file")
+passed=0
+for trial in $(seq 1 "$trials"); do
+    dir="$run_dir/trial-$trial"
+    mkdir -p "$dir"
+    setup_trial "$dir"
+    prompt=${prompt_template//\{\{SCRATCH\}\}/$SCRATCH}
+    session=$(uuidgen | tr 'A-Z' 'a-z')
+    git -C "$CALLER" status --porcelain >"$dir/caller-status-before"
+    caller_head=$(git -C "$CALLER" rev-parse HEAD)
+    real_repos_state >"$dir/real-repos-before"
+    start=$(date +%s)
+    run_claude "$dir" "$session" "$prompt"
+    elapsed=$(( $(date +%s) - start ))
+    real_repos_state >"$dir/real-repos-after"
+    transcript=$(ls "$config_dir"/projects/*/"$session.jsonl" 2>/dev/null | head -n 1)
+    TOOLS_REPO_CANON=$TOOLS_REPO
+    [ -d "$TOOLS_REPO" ] && TOOLS_REPO_CANON=$(cd -P -- "$TOOLS_REPO" && pwd -P)
+    cat >"$dir/trial.env" <<EOF
+SCENARIO=$scenario
+PLUGIN_ROOT=$plugin_root
+CALLER=$(cd -P -- "$CALLER" && pwd -P)
+CALLER_HEAD=$caller_head
+CALLER_STATUS_FILE=$dir/caller-status-before
+TOOLS_REPO=$TOOLS_REPO_CANON
+TOOLS_BASE=$TOOLS_BASE
+SCRATCH=$SCRATCH
+PRESEED_TOOL=$PRESEED_TOOL
+RESULT_JSON=$dir/claude.json
+TRANSCRIPT=$transcript
+SUBAGENT_DIR=${transcript%.jsonl}/subagents
+EOF
+    python3 -I "$scenarios_dir/check-trial" "$dir" >"$dir/check.txt" 2>&1
+    check_rc=$?
+    reason=$(sed -n 's/^fail: //p' "$dir/check.txt" | head -n 1)
+    [ "$CLAUDE_RC" -eq 0 ] || reason="claude exited $CLAUDE_RC${reason:+; $reason}"
+    real_repos_ok=yes
+    if ! cmp -s "$dir/real-repos-before" "$dir/real-repos-after"; then
+        real_repos_ok=no
+        reason="real tools repos changed (compare real-repos-before and real-repos-after)${reason:+; $reason}"
+    fi
+    if [ "$check_rc" -eq 0 ] && [ "$CLAUDE_RC" -eq 0 ] && [ "$real_repos_ok" = yes ]; then
+        verdict=PASS
+        reason="all checks passed"
+        passed=$((passed + 1))
+    else
+        verdict=FAIL
+        n=$(grep -c '^fail: ' "$dir/check.txt")
+        [ "$n" -le 1 ] || reason="$reason (+$((n - 1)) more)"
+    fi
+    printf '%s %s %s trial %d (%ss): %s\n    transcript: %s\n' \
+        "$verdict" "$scenario" "$label" "$trial" "$elapsed" "$reason" "${transcript:-none}"
+done
+printf '%s %s: %d/%d passed. Logs: %s (check.txt per trial)\n' \
+    "$scenario" "$label" "$passed" "$trials" "$run_dir"
+[ "$passed" -eq "$trials" ]
