@@ -42,15 +42,22 @@ gets a script in scratch.
 
 ## Installing
 
-The plugin isn't published to a marketplace. On Claude Code, install it
-from a checkout through its local marketplace:
+On Claude Code, install it from the Prime Radiant marketplace:
 
 ```
-claude plugin marketplace add /path/to/toolsmith
-claude plugin install toolsmith@toolsmith-dev
+claude plugin marketplace add prime-radiant-inc/prime-radiant-marketplace
+claude plugin install toolsmith@prime-radiant-marketplace
 ```
 
-or try it for one session with `claude --plugin-dir /path/to/toolsmith`.
+On Codex, add this repository as a marketplace and install from it:
+
+```
+codex plugin marketplace add prime-radiant-inc/toolsmith
+codex plugin add toolsmith@toolsmith-dev
+```
+
+To try a checkout for one Claude Code session, use
+`claude --plugin-dir /path/to/toolsmith`.
 
 Other harnesses load the same checkout. Each one's install steps are in
 `docs/install/<harness>.md` (table below), and `docs/support-matrix.md`
