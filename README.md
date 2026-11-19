@@ -87,8 +87,10 @@ hand-edit the generated files.
 
 ### Outside Claude Code
 
-Only Claude Code gets the hooks and the `toolsmith:toolsmith` agent. On
-other harnesses the `writing-tools` skill does their job: the agent runs
+Only Claude Code and OpenCode get the hooks and the `toolsmith` agent; on
+OpenCode it is registered as a plain subagent by the plugin, so it is
+`toolsmith`, not `toolsmith:toolsmith`. On the other harnesses the
+`writing-tools` skill does their job: the agent runs
 `toolsmith-repo locate` itself to find the catalogs, and when it needs a
 tool it launches a general-purpose subagent with everything the toolsmith
 needs pasted into the prompt (the agent's instructions, both reference
