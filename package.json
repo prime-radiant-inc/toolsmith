@@ -9,6 +9,9 @@
   "license": "MIT",
   "type": "module",
   "main": "./.opencode/plugins/toolsmith.js",
+  "exports": {
+    ".": "./.opencode/plugins/toolsmith.js"
+  },
   "pi": {
     "extensions": [
       "./.pi/extensions/toolsmith.ts"

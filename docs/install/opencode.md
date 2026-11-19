@@ -2,23 +2,43 @@
 
 # Installing toolsmith on OpenCode
 
+OpenCode V2 only. The plugin is dual-shaped, so a V1 host still loads it, but
+the instructions below use V2 configuration.
+
 ## What gets emitted
 
 - `package.json` (shared with the pi adapter when both are active)
-- `.opencode/plugins/toolsmith.js`, the OpenCode plugin module that registers the plugin's skills directory and injects bootstrap context
+- `.opencode/plugins/toolsmith.js`, the OpenCode plugin module. It registers
+  the skills directory and the `toolsmith` subagent through plugin transforms
+  and injects bootstrap context through session hooks
 - a `.opencode/agent/<name>.md` file for each agent (`toolsmith`)
 - the generated bootstrap file at `hooks/everyharness/bootstrap.md`
 
 ## Installing
 
-Add the plugin to your project's `opencode.json`:
+Add the plugin to your global `opencode.json(c)`:
 
-```json
-{ "plugin": ["toolsmith@git+<your-repo>.git"] }
+```jsonc
+{ "$schema": "https://opencode.ai/config.json", "plugins": ["toolsmith@git+<your-repo>.git"] }
 ```
 
-OpenCode loads the plugin module on startup: it registers the skills directory through a config hook (no symlinks needed) and reads commands/agents translated under `.opencode/`. Consult the OpenCode plugin docs if this doesn't match your installed version.
+or let the CLI write it:
+
+```sh
+opencode plugin add 'git+<your-repo>.git'
+```
+
+OpenCode loads the module on startup: the default export's `setup()` registers
+the skill and the subagent, and the session hooks carry the bootstrap. Skills
+resolve from the plugin checkout, so no symlinks are needed.
 
 ## Caveats
 
-- `package.json` is generated at the plugin root; if you maintain your own `package.json` for this plugin, exclude the opencode and pi adapters from generation (`harnesses.exclude`) or merge the fields by hand.
+- `package.json` is generated at the plugin root; if you maintain your own
+  `package.json` for this plugin, exclude the opencode and pi adapters from
+  generation (`harnesses.exclude`) or merge the fields by hand.
+- OpenCode watches configured plugin directories and reloads config on save.
+  After an update to the plugin, run `opencode service restart` (or `/reload`)
+  so the new module is imported.
+- The toolsmith subagent needs the plugin's `bin/` to stay on disk. Do not
+  install from a package manager cache that gets pruned mid-session.

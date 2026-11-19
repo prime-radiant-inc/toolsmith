@@ -10,7 +10,7 @@
 | devin | full | none | none | none | none | none |
 | kimi | full | none | none | none | none | partial |
 | gemini | full | full | none | none | none | full |
-| opencode | full | full | partial | none | none | full |
+| opencode | full | full | full | none | none | full |
 | pi | full | none | none | none | none | full |
 | hermes | full | none | none | none | none | full |
 | muse | full | none | none | full | none | full |
